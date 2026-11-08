@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Env Doctor
 
 A zero-dependency CLI that checks whether the variable names in `.env` match `.env.example`.
@@ -73,8 +72,9 @@ This makes it suitable for CI:
 
 ```bash
 npm test
+
+
 ```
-=======
+
 # Env-Doc
 A lightweight CLI to compare environment variable names between .env and .env.example files.
->>>>>>> 52e5ba9d08bea2de3df3dff5a98a31712f90e1f5
