@@ -1,0 +1,21 @@
+{
+  "name": "env-doc",
+  "version": "1.0.0",
+  "description": "Check .env files against .env.example and report missing or extra variables.",
+  "type": "commonjs",
+  "bin": {
+    "env-doctor": "bin/env-doctor.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ]
+}
