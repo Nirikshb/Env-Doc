@@ -383,6 +383,109 @@ function classifyHost(hostname) {
   return 'public-looking';
 }
 
+function editDistance(a, b) {
+  a = String(a).toLowerCase();
+  b = String(b).toLowerCase();
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = new Array(b.length + 1);
+  const curr = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+  }
+  return prev[b.length];
+}
+
+const ENV_IDENTIFIER_NAMES = new Set(['NODE_ENV', 'APP_ENV', 'ENV', 'ENVIRONMENT', 'APP_ENVIRONMENT']);
+const KNOWN_ENV_LABELS = ['local', 'development', 'dev', 'staging', 'stage', 'production', 'prod', 'test'];
+const PLACEHOLDER_PATTERNS = [
+  /^change_?me$/i,
+  /^changeme$/i,
+  /^replace_?(me|this)$/i,
+  /^your_.*_here$/i,
+  /^insert_.*_here$/i,
+  /^todo$/i,
+  /^placeholder$/i,
+  /^xxx+$/i,
+];
+
+function collectPotentialFindings(parsed, envLabel, fileIdentity, counterpartNames) {
+  const findings = [];
+  const names = [...parsed.names];
+
+  // empty values
+  for (const d of parsed.declarations) {
+    if (!d.name || d.invalid) continue;
+    if (d.empty) {
+      findings.push({ category: 'potential', rule: 'VAL_EMPTY_VALUE', severity: 'warning', confidence: 'medium', variable: d.name, environment: envLabel, file: fileIdentity, line: d.line, message: 'Empty configuration value.', suggestion: null });
+    }
+  }
+
+  // placeholder values
+  for (const d of parsed.declarations) {
+    if (!d.name || d.invalid) continue;
+    const v = String(d.value).trim();
+    if (!v) continue;
+    const upper = v.toUpperCase();
+    if (PLACEHOLDER_PATTERNS.some((re) => re.test(v))) {
+      findings.push({ category: 'potential', rule: 'VAL_SUSPICIOUS_PLACEHOLDER', severity: 'warning', confidence: 'medium', variable: d.name, environment: envLabel, file: fileIdentity, line: d.line, message: 'Suspicious placeholder value.', suggestion: null });
+    }
+  }
+
+  // env identifier typos
+  for (const d of parsed.declarations) {
+    if (!d.name || d.invalid) continue;
+    if (!ENV_IDENTIFIER_NAMES.has(String(d.name).toUpperCase())) continue;
+    const val = String(d.value).trim().toLowerCase();
+    if (!val) continue;
+    if (KNOWN_ENV_LABELS.includes(val)) continue;
+    // find closest known label
+    let best = null; let bestDist = Infinity; let tie = false;
+    for (const label of KNOWN_ENV_LABELS) {
+      const dist = editDistance(val, label);
+      if (dist < bestDist) { bestDist = dist; best = label; tie = false; }
+      else if (dist === bestDist) { tie = true; }
+    }
+    // threshold: small distance, not too large
+    const threshold = val.length <= 4 ? 1 : 2;
+    if (best && bestDist > 0 && bestDist <= threshold && !tie) {
+      findings.push({ category: 'potential', rule: 'TYPO_ENVIRONMENT_VALUE', severity: 'warning', confidence: bestDist === 1 ? 'high' : 'medium', variable: d.name, environment: envLabel, file: fileIdentity, line: d.line, message: 'Environment identifier resembles a known label.', suggestion: null });
+    }
+  }
+
+  // variable name typos (missing/extra relative to counterpart)
+  if (counterpartNames && counterpartNames.size) {
+    const counterpart = [...counterpartNames];
+    for (const name of names) {
+      if (counterpart.includes(name)) continue;
+      // find closest counterpart not equal
+      let best = null; let bestDist = Infinity; let tie = false; let count = 0;
+      for (const c of counterpart) {
+        if (c === name) continue;
+        const dist = editDistance(name, c);
+        if (dist < bestDist) { bestDist = dist; best = c; tie = false; count = 1; }
+        else if (dist === bestDist) { tie = true; count++; }
+      }
+      const len = Math.max(name.length, (best || '').length);
+      if (len < 4) continue;
+      const threshold = len <= 6 ? 1 : 2;
+      if (best && bestDist > 0 && bestDist <= threshold && !tie) {
+        const decl = parsed.declarations.find((d) => d.name === name);
+        findings.push({ category: 'potential', rule: 'TYPO_VARIABLE_NAME', severity: 'warning', confidence: bestDist === 1 ? 'high' : 'medium', variable: name, environment: envLabel, file: fileIdentity, line: decl ? decl.line : null, message: 'Variable name resembles another declared variable.', suggestion: null });
+      }
+    }
+  }
+
+  return findings;
+}
+
 function collectHttpsFindings(parsed, envLabel, fileIdentity) {
   const findings = [];
   const stagingOrProd = isStagingEnv(envLabel) || isProdEnv(envLabel);
@@ -468,6 +571,9 @@ function compareEnvironments(sourceFile, targetFile, sourceEnvOpt, targetEnvOpt)
   confirmedIssues.push(...collectUrlFindings(tgt.parsed, targetEnv, 'target'));
   confirmedIssues.push(...collectHttpsFindings(src.parsed, sourceEnv, 'source'));
   confirmedIssues.push(...collectHttpsFindings(tgt.parsed, targetEnv, 'target'));
+  const potentialIssues = [];
+  potentialIssues.push(...collectPotentialFindings(src.parsed, sourceEnv, 'source', tgt.parsed.names));
+  potentialIssues.push(...collectPotentialFindings(tgt.parsed, targetEnv, 'target', null));
   for (const d of tgt.parsed.declarations) if (d.duplicate) confirmedIssues.push({ category: 'confirmed', rule: 'DUPLICATE_DECLARATION', file: 'target', variable: d.name, line: d.line, message: 'Duplicate declaration in target file.' });
   for (const inv of srcInvalid) confirmedIssues.push({ category: 'confirmed', rule: 'INVALID_DECLARATION', file: 'source', variable: inv.name, line: inv.line, message: 'Malformed declaration in source file.' });
   for (const inv of tgtInvalid) confirmedIssues.push({ category: 'confirmed', rule: 'INVALID_DECLARATION', file: 'target', variable: inv.name, line: inv.line, message: 'Malformed declaration in target file.' });
@@ -492,7 +598,7 @@ function compareEnvironments(sourceFile, targetFile, sourceEnvOpt, targetEnvOpt)
     findings: [...confirmedIssues, ...environmentDifferences],
     confirmedIssues,
     environmentDifferences,
-    potentialIssues: [],
+    potentialIssues,
     missing: [],
     extra: [],
   };
@@ -595,4 +701,4 @@ function main(argv = process.argv.slice(2)) {
 }
 
 if (require.main === module) process.exitCode = main();
-module.exports = { compare, main, parseArgs, parseVariableNames, parseEnvFile, compareEnvironments, inferEnvLabel, isHttpUrlCandidate, validateHttpUrlValue, collectUrlFindings, collectHttpsFindings, classifyHost, isLocalEnv, isStagingEnv, isProdEnv };
+module.exports = { compare, main, parseArgs, parseVariableNames, parseEnvFile, compareEnvironments, inferEnvLabel, isHttpUrlCandidate, validateHttpUrlValue, collectUrlFindings, collectHttpsFindings, collectPotentialFindings, classifyHost, isLocalEnv, isStagingEnv, isProdEnv, editDistance };
