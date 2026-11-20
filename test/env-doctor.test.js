@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { compare, parseVariableNames, parseEnvFile, compareEnvironments } = require('../bin/env-doctor.js');
+const { compare, parseVariableNames, parseEnvFile, compareEnvironments, isHttpUrlCandidate, validateHttpUrlValue, collectUrlFindings } = require('../bin/env-doctor.js');
 
 function fixture(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-doctor-'));
@@ -66,4 +66,19 @@ test('compareEnvironments detects duplicates and invalid declarations', () => {
   assert.equal(res.confirmedIssues.length, 2); // duplicate + invalid
   assert.ok(res.confirmedIssues.some((f) => f.rule === 'DUPLICATE_DECLARATION'));
   assert.ok(res.confirmedIssues.some((f) => f.rule === 'INVALID_DECLARATION'));
+});
+
+test('URL candidate detection and syntax validation', () => {
+  assert.equal(isHttpUrlCandidate('API_URL', 'https://example.com:8080/a?x=1#f'), true);
+  assert.equal(isHttpUrlCandidate('FOO', 'http://example.com'), true);
+  assert.equal(isHttpUrlCandidate('DATABASE_URL', 'postgres://localhost/db'), false);
+  assert.equal(isHttpUrlCandidate('REDIS_URL', 'redis://localhost:6379'), false);
+  assert.equal(validateHttpUrlValue('https://example.com'), true);
+  assert.equal(validateHttpUrlValue('not a url'), false);
+  assert.equal(validateHttpUrlValue('ftp://example.com'), false);
+  const parsed = parseEnvFile('API_URL=https://example.com/?token=secret-sentinel\nDB_URL=postgres://localhost/db\nBAD_URL=not-a-url\n');
+  const findings = collectUrlFindings(parsed, 'local', 'source');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].rule, 'URL_INVALID_SYNTAX');
+  assert.ok(!JSON.stringify(findings).includes('secret-sentinel'));
 });

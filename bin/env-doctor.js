@@ -4,6 +4,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const net = require('node:net');
 
 const DEFAULT_ENV_FILE = '.env';
 const DEFAULT_EXAMPLE_FILE = '.env.example';
@@ -262,6 +263,149 @@ function readEnvFile(filePath) {
   return { contents, parsed: parseEnvFile(contents) };
 }
 
+const URL_CONVENTIONAL_SUFFIXES = ['_URL', '_URI', '_ENDPOINT', '_ORIGIN'];
+const URL_EXCLUDED_NAME_PARTS = ['DB', 'DATABASE', 'REDIS', 'CONNECTION', 'DSN', 'MONGO', 'POSTGRES', 'MYSQL', 'MARIADB', 'SQL'];
+
+function isExcludedUrlName(name) {
+  const upper = String(name).toUpperCase();
+  return URL_EXCLUDED_NAME_PARTS.some((p) => upper.includes(p));
+}
+
+function isConventionalUrlName(name) {
+  const upper = String(name).toUpperCase();
+  if (isExcludedUrlName(upper)) return false;
+  return URL_CONVENTIONAL_SUFFIXES.some((s) => upper.endsWith(s));
+}
+
+function isHttpUrlCandidate(name, value) {
+  const v = String(value == null ? '' : value).trim();
+  if (/^https?:\/\//i.test(v)) return true;
+  if (isConventionalUrlName(name) && /:\/\//.test(v)) return true;
+  // conventional name with relative path counts as candidate (will be invalid)
+  if (isConventionalUrlName(name) && v.length > 0 && !/:\/\//.test(v)) return true;
+  return false;
+}
+
+function validateHttpUrlValue(value) {
+  const v = String(value == null ? '' : value).trim();
+  try {
+    const u = new URL(v);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    if (!u.hostname) return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function collectUrlFindings(parsed, envLabel, fileIdentity) {
+  const findings = [];
+  for (const d of parsed.declarations) {
+    if (!d.name || d.invalid) continue;
+    if (!isHttpUrlCandidate(d.name, d.value)) continue;
+    if (!validateHttpUrlValue(d.value)) {
+      findings.push({
+        category: 'confirmed',
+        rule: 'URL_INVALID_SYNTAX',
+        severity: 'error',
+        variable: d.name,
+        environment: envLabel,
+        file: fileIdentity,
+        line: d.line,
+        message: 'Malformed or non-HTTP(S) URL syntax in an HTTP(S) configuration value.',
+        suggestion: 'Provide a valid absolute http:// or https:// URL.',
+      });
+    }
+  }
+  return findings;
+}
+
+function isLocalEnv(label) {
+  const l = String(label || '').toLowerCase();
+  return l === 'local' || l === 'development' || l === 'dev';
+}
+function isStagingEnv(label) {
+  const l = String(label || '').toLowerCase();
+  return l === 'staging' || l === 'stage';
+}
+function isProdEnv(label) {
+  const l = String(label || '').toLowerCase();
+  return l === 'production' || l === 'prod';
+}
+
+function ipv4ToInt(ip) {
+  const parts = ip.split('.').map((x) => parseInt(x, 10));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return null;
+  return ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
+}
+function inCidr(ipInt, base, prefix) {
+  const mask = prefix === 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) >>> 0;
+  return (ipInt & mask) === (base & mask);
+}
+
+function classifyHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  if (!h) return 'unknown';
+  if (h === 'localhost') return 'loopback';
+  if (h.endsWith('.localhost')) return 'loopback';
+  if (h.endsWith('.local')) return 'local';
+  // IPv6
+  if (h.includes(':')) {
+    if (h === '::1') return 'loopback';
+    if (h === '::') return 'unspecified';
+    // fc00::/7 unique local
+    if (/^f[cd]/.test(h)) return 'private';
+    // fe80::/10 link-local
+    if (/^fe[89ab]/.test(h)) return 'link-local';
+    // IPv4-mapped ::ffff:a.b.c.d
+    const m = h.match(/^::ffff:(.+)$/);
+    if (m) return classifyHost(m[1]);
+    return 'public-looking';
+  }
+  // IPv4
+  if (net.isIP(h) === 4) {
+    const ipInt = ipv4ToInt(h);
+    if (ipInt === null) return 'unknown';
+    if (h === '0.0.0.0') return 'unspecified';
+    if (inCidr(ipInt, ipv4ToInt('127.0.0.0'), 8)) return 'loopback';
+    if (inCidr(ipInt, ipv4ToInt('10.0.0.0'), 8)) return 'private';
+    if (inCidr(ipInt, ipv4ToInt('172.16.0.0'), 12)) return 'private';
+    if (inCidr(ipInt, ipv4ToInt('192.168.0.0'), 16)) return 'private';
+    if (inCidr(ipInt, ipv4ToInt('169.254.0.0'), 16)) return 'link-local';
+    // documentation ranges
+    if (inCidr(ipInt, ipv4ToInt('192.0.2.0'), 24)) return 'reserved';
+    if (inCidr(ipInt, ipv4ToInt('198.51.100.0'), 24)) return 'reserved';
+    if (inCidr(ipInt, ipv4ToInt('203.0.113.0'), 24)) return 'reserved';
+    return 'public-looking';
+  }
+  // single-label internal hostname
+  if (!h.includes('.')) return 'local';
+  return 'public-looking';
+}
+
+function collectHttpsFindings(parsed, envLabel, fileIdentity) {
+  const findings = [];
+  const stagingOrProd = isStagingEnv(envLabel) || isProdEnv(envLabel);
+  const isProd = isProdEnv(envLabel);
+  for (const d of parsed.declarations) {
+    if (!d.name || d.invalid) continue;
+    if (!isHttpUrlCandidate(d.name, d.value)) continue;
+    let url;
+    try { url = new URL(String(d.value).trim()); } catch (e) { continue; } // syntax already handled in 4A
+    if (url.protocol !== 'http:') continue;
+    const hostClass = classifyHost(url.hostname);
+    const isLoopback = hostClass === 'loopback';
+    const isPublicLooking = hostClass === 'public-looking';
+    if (isProd && isLoopback) {
+      findings.push({ category: 'confirmed', rule: 'URL_LOCALHOST_IN_PROD', severity: 'error', variable: d.name, environment: envLabel, file: fileIdentity, line: d.line, message: 'Loopback endpoint configured for production.', suggestion: 'Use a production endpoint.' });
+    }
+    if (stagingOrProd && isPublicLooking) {
+      findings.push({ category: 'confirmed', rule: 'URL_PUBLIC_HTTP', severity: 'error', variable: d.name, environment: envLabel, file: fileIdentity, line: d.line, message: 'Public HTTP endpoint in staging or production.', suggestion: 'Use HTTPS.' });
+    }
+  }
+  return findings;
+}
+
 function inferEnvLabel(filePath) {
   const base = path.basename(filePath).toLowerCase();
   const m = base.match(/\.env(?:\.(.+))?$/);
@@ -320,6 +464,10 @@ function compareEnvironments(sourceFile, targetFile, sourceEnvOpt, targetEnvOpt)
 
   const confirmedIssues = [];
   for (const d of src.parsed.declarations) if (d.duplicate) confirmedIssues.push({ category: 'confirmed', rule: 'DUPLICATE_DECLARATION', file: 'source', variable: d.name, line: d.line, message: 'Duplicate declaration in source file.' });
+  confirmedIssues.push(...collectUrlFindings(src.parsed, sourceEnv, 'source'));
+  confirmedIssues.push(...collectUrlFindings(tgt.parsed, targetEnv, 'target'));
+  confirmedIssues.push(...collectHttpsFindings(src.parsed, sourceEnv, 'source'));
+  confirmedIssues.push(...collectHttpsFindings(tgt.parsed, targetEnv, 'target'));
   for (const d of tgt.parsed.declarations) if (d.duplicate) confirmedIssues.push({ category: 'confirmed', rule: 'DUPLICATE_DECLARATION', file: 'target', variable: d.name, line: d.line, message: 'Duplicate declaration in target file.' });
   for (const inv of srcInvalid) confirmedIssues.push({ category: 'confirmed', rule: 'INVALID_DECLARATION', file: 'source', variable: inv.name, line: inv.line, message: 'Malformed declaration in source file.' });
   for (const inv of tgtInvalid) confirmedIssues.push({ category: 'confirmed', rule: 'INVALID_DECLARATION', file: 'target', variable: inv.name, line: inv.line, message: 'Malformed declaration in target file.' });
@@ -447,4 +595,4 @@ function main(argv = process.argv.slice(2)) {
 }
 
 if (require.main === module) process.exitCode = main();
-module.exports = { compare, main, parseArgs, parseVariableNames, parseEnvFile, compareEnvironments, inferEnvLabel };
+module.exports = { compare, main, parseArgs, parseVariableNames, parseEnvFile, compareEnvironments, inferEnvLabel, isHttpUrlCandidate, validateHttpUrlValue, collectUrlFindings, collectHttpsFindings, classifyHost, isLocalEnv, isStagingEnv, isProdEnv };
